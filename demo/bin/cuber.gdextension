@@ -1,0 +1,9 @@
+[configuration]
+entry_symbol = "cuber_init"
+compatibility_minimum = "4.1"
+reloadable = true
+
+[libraries]
+windows.debug.x86_64 = "res://bin/cuber.windows.template_debug.x86_64.dll"
+linux.debug.x86_64 = "res://bin/cuber.linux.template_debug.x86_64.so"
+macos.debug = "res://bin/cuber.macos.template_debug.framework"
