@@ -1,18 +1,12 @@
 #include <godot_cpp/godot.hpp>
 
-#include "chunk_controller.h"
-#include "chunk_mesh_builder.h"
 #include "cube_builder.h"
-#include "test.h"
 
 using namespace godot;
 
 void init_mod(ModuleInitializationLevel l) {
     if (l == MODULE_INITIALIZATION_LEVEL_SCENE)
     {
-        GDREGISTER_CLASS(ChunkController);
-        GDREGISTER_CLASS(ChunkMeshBuilder);
-        GDREGISTER_CLASS(TestNode);
         GDREGISTER_CLASS(CubeBuilder);
 		GDREGISTER_INTERNAL_CLASS(ChunkInfo);
     }
