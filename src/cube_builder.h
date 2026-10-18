@@ -2,6 +2,7 @@
 
 #include <godot_cpp/classes/resource.hpp>
 #include <godot_cpp/variant/typed_dictionary.hpp>
+#include "concurrency_guard.h"
 
 namespace godot {
 
@@ -26,6 +27,8 @@ enum BlockDirection {
 	COUNT,
 };
 
+class CubeBuilder;
+
 class ChunkInfo : public RefCounted {
 	GDCLASS(ChunkInfo, RefCounted)
 public:
@@ -36,8 +39,9 @@ public:
 	void shutdown();
 
 	void set_block_type(const BlockIndex& index, const BlockType& block_type);
+	BlockType get_block_at(const BlockIndex& index);
 
-	Ref<ArrayMesh> rebuild_chunk_geometry();
+	Ref<ArrayMesh> rebuild_chunk_geometry(const Ref<CubeBuilder>& builder);
 
 	ChunkIndex get_chunk_index() const { return m_chunk_index; }
 protected:
@@ -64,10 +68,16 @@ protected:
 	static ChunkIndex get_chunk_from_global(const GlobalBlockIndex& index);
 
 	bool m_chunks_dirty;
+	ConcurrencyGuard m_grid_info_guard;
 
 public:
 	void set_block(const GlobalBlockIndex& global_block_index, const BlockType& blockType);
 	void clear_all_blocks();
+
+	bool is_block_air(const GlobalBlockIndex& global_block_index) const;
+
+	static Vector3i get_chunk_dimensions();
+	static BlockIndex convert_global_index_to_block_index(const GlobalBlockIndex& global_block_index);
 
 	void rebuild_chunk_geometry();
 

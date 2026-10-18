@@ -39,6 +39,8 @@ void ChunkInfo::set_block_type(const BlockIndex& index, const BlockType& blockTy
 	ERR_FAIL_NULL_MSG(m_block_types, "Block array was null in ChunkInfo");
 	ERR_FAIL_COND_MSG(out_of_bounds(index), vformat("Block index [%d %d %d] is outside the chunk", index.x, index.y, index.z));
 	const int32_t block_address = convert_index_to_address(index);
+
+	//UtilityFunctions::print(vformat("Setting block %d to %d", block_address, blockType));
 	m_block_types[block_address] = blockType;
 	m_chunk_dirty = true;
 }
@@ -69,21 +71,37 @@ static const Vector3i face_dirs[6] = {
 	Vector3i(0, 0, -1), 
 };
 
-Ref<ArrayMesh> ChunkInfo::rebuild_chunk_geometry() {
+BlockType ChunkInfo::get_block_at(const BlockIndex& index) {
+	const int32_t address = convert_index_to_address(index);
+	ERR_FAIL_COND_V_MSG(address < 0 || address >= (chunk_width * chunk_height * chunk_depth), 0, "Tried indexing outside of bounds");
+	return m_block_types[address];
+}
+
+bool CubeBuilder::is_block_air(const GlobalBlockIndex& global_block_index) const {
+	const ChunkIndex& chunk_index = get_chunk_from_global(global_block_index);
+	Ref<ChunkInfo> chunk_info = m_chunks.get(chunk_index, nullptr);
+	if (!chunk_info.is_valid()) {
+		return true;
+	}
+
+	const BlockIndex block_index = CubeBuilder::convert_global_index_to_block_index(global_block_index);
+	return chunk_info->get_block_at(block_index) == 0;
+}
+
+Ref<ArrayMesh> ChunkInfo::rebuild_chunk_geometry(const Ref<CubeBuilder>& builder) {
 	if (!m_chunk_dirty)
 		return nullptr;
 
-	m_chunk_dirty = false;
+	ERR_FAIL_COND_V_MSG(!builder.is_valid(), nullptr, "Builder was nullptr");
 
-	/*var verts: PackedVector3Array
-	var normals: PackedVector3Array
-	var uvs: PackedVector2Array
-	var indices: PackedInt32Array*/
+	m_chunk_dirty = false;
 
 	PackedVector3Array verts;
 	PackedVector3Array normals;
 	PackedVector2Array uvs;
 	PackedInt32Array indices;
+
+	const GlobalBlockIndex chunk_first_block = Vector3i(m_chunk_index.x * chunk_width, m_chunk_index.y * chunk_height, m_chunk_index.z * chunk_depth);
 
 	const int32_t block_count = chunk_width * chunk_height * chunk_depth;
 	for (int32_t i = 0; i < block_count; ++i) {
@@ -96,31 +114,26 @@ Ref<ArrayMesh> ChunkInfo::rebuild_chunk_geometry() {
 		const Vector3 block_center = Vector3(block_index);
 		for (int32_t d = 0; d < BlockDirection::COUNT; ++d) {
 			const BlockIndex neighbor_index = block_index + face_dirs[d];
-
-			if (out_of_bounds(neighbor_index))
+			
+			const GlobalBlockIndex global_index = chunk_first_block + neighbor_index;
+			if (!builder->is_block_air(global_index)) {
 				continue;
-
-			const int32_t neighbor_address = convert_index_to_address(neighbor_index);
-
-			// TODO: this does not cross chunk boundaries yet
-			const int32_t base = verts.size();
-			const bool neighbor_is_air = is_block_air(m_block_types[neighbor_address]);
-
-			Vector3 normal = Vector3(face_dirs[d]);
-			if (neighbor_is_air) {
-				for (int32_t c = 0; c < 4; ++c) {
-					verts.append(block_center + face_corners[d * 4 + c]);
-					normals.append(normal);
-					uvs.append(face_uvs[c]);
-				}
-
-				indices.append(base);
-				indices.append(base + 1);
-				indices.append(base + 2);
-				indices.append(base);
-				indices.append(base + 2);
-				indices.append(base + 3);
 			}
+
+			const int32_t base = verts.size();
+			Vector3 normal = Vector3(face_dirs[d]);
+			for (int32_t c = 0; c < 4; ++c) {
+				verts.append(block_center + face_corners[d * 4 + c]);
+				normals.append(normal);
+				uvs.append(face_uvs[c]);
+			}
+
+			indices.append(base);
+			indices.append(base + 1);
+			indices.append(base + 2);
+			indices.append(base);
+			indices.append(base + 2);
+			indices.append(base + 3);
 		}
 	}
 
@@ -183,17 +196,21 @@ CubeBuilder::CubeBuilder() {
 }
 
 CubeBuilder::~CubeBuilder() {
-	
 }
 
 void CubeBuilder::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_block", "global_block_index", "block_type"), &CubeBuilder::set_block);
 	ClassDB::bind_method(D_METHOD("rebuild_chunk_geometry"), &CubeBuilder::rebuild_chunk_geometry);
 	ClassDB::bind_method(D_METHOD("clear_all_blocks"), &CubeBuilder::clear_all_blocks);
+	ClassDB::bind_static_method("CubeBuilder", D_METHOD("get_chunk_dimensions"), &CubeBuilder::get_chunk_dimensions);
 
 	ADD_SIGNAL(MethodInfo("on_chunk_mesh_ready", 
 		PropertyInfo(Variant::VECTOR3I, "chunk_index"),
 		PropertyInfo(Variant::OBJECT, "chunk_array_mesh", PROPERTY_HINT_RESOURCE_TYPE, "ArrayMesh")));
+}
+
+Vector3i CubeBuilder::get_chunk_dimensions() {
+	return Vector3i(chunk_width, chunk_height, chunk_depth);
 }
 
 void CubeBuilder::clear_all_blocks() {
@@ -201,16 +218,18 @@ void CubeBuilder::clear_all_blocks() {
 	m_chunks_dirty = true;
 }
 
-void CubeBuilder::set_block(const GlobalBlockIndex& global_block_index, const BlockType& block_type) {
-	Ref<ChunkInfo> chunk = get_or_create_chunk(global_block_index);
-
+BlockIndex CubeBuilder::convert_global_index_to_block_index(const GlobalBlockIndex& global_block_index) {
 	const ChunkIndex& chunk_index = get_chunk_from_global(global_block_index);
 	const GlobalBlockIndex chunk_first_block = Vector3i(chunk_index.x * chunk_width, chunk_index.y * chunk_height, chunk_index.z * chunk_depth);
-	const BlockIndex block_index = global_block_index - chunk_first_block;
+	return 	global_block_index - chunk_first_block;
+}
 
+void CubeBuilder::set_block(const GlobalBlockIndex& global_block_index, const BlockType& block_type) {
+	CONCURRENCY_CHECK(m_grid_info_guard);
+	Ref<ChunkInfo> chunk = get_or_create_chunk(global_block_index);
+	const BlockIndex block_index = convert_global_index_to_block_index(global_block_index);
 	ERR_FAIL_NULL_MSG(chunk, "Could not find chunk");
 	chunk->set_block_type(block_index, block_type);
-
 	m_chunks_dirty = true;
 }
 
@@ -218,7 +237,10 @@ void CubeBuilder::rebuild_chunk_geometry() {
 	if (!m_chunks_dirty)
 		return;
 
+	CONCURRENCY_CHECK(m_grid_info_guard);
 	m_chunks_dirty = false;
+
+	Ref<CubeBuilder> self = Ref<CubeBuilder>(this);
 
 	Array values = m_chunks.values();
 	const int32_t value_count = values.size();
@@ -227,7 +249,7 @@ void CubeBuilder::rebuild_chunk_geometry() {
 		if (!chunk.is_valid())
 			continue;
 		
-		Ref<ArrayMesh> new_mesh = chunk->rebuild_chunk_geometry();
+		Ref<ArrayMesh> new_mesh = chunk->rebuild_chunk_geometry(self);
 		emit_signal("on_chunk_mesh_ready", chunk->get_chunk_index(), new_mesh);
 	}
 }
