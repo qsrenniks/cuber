@@ -198,11 +198,22 @@ CubeBuilder::CubeBuilder() {
 CubeBuilder::~CubeBuilder() {
 }
 
+int CubeBuilder::get_block(const GlobalBlockIndex& global_block_index) const {
+	Ref<ChunkInfo> chunk = get_chunk(global_block_index);
+	if (!chunk.is_valid()) {
+		return 0;
+	}
+
+	const BlockIndex block_index = convert_global_index_to_block_index(global_block_index);
+	return chunk->get_block_at(block_index);
+}
+
 void CubeBuilder::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_block", "global_block_index", "block_type"), &CubeBuilder::set_block);
 	ClassDB::bind_method(D_METHOD("rebuild_chunk_geometry"), &CubeBuilder::rebuild_chunk_geometry);
 	ClassDB::bind_method(D_METHOD("clear_all_blocks"), &CubeBuilder::clear_all_blocks);
 	ClassDB::bind_static_method("CubeBuilder", D_METHOD("get_chunk_dimensions"), &CubeBuilder::get_chunk_dimensions);
+	ClassDB::bind_method(D_METHOD("get_block"), &CubeBuilder::get_block);
 
 	ADD_SIGNAL(MethodInfo("on_chunk_mesh_ready", 
 		PropertyInfo(Variant::VECTOR3I, "chunk_index"),
@@ -224,12 +235,30 @@ BlockIndex CubeBuilder::convert_global_index_to_block_index(const GlobalBlockInd
 	return 	global_block_index - chunk_first_block;
 }
 
+static bool block_on_border(const BlockIndex& index) {
+	const bool x_on_border = index.x == 0 || index.x == chunk_width - 1;
+	const bool y_on_border = index.y == 0 || index.y == chunk_height - 1;
+	const bool z_on_border = index.z == 0 || index.z == chunk_depth - 1;
+	return x_on_border || y_on_border || z_on_border;
+}
+
 void CubeBuilder::set_block(const GlobalBlockIndex& global_block_index, const BlockType& block_type) {
 	CONCURRENCY_CHECK(m_grid_info_guard);
 	Ref<ChunkInfo> chunk = get_or_create_chunk(global_block_index);
 	const BlockIndex block_index = convert_global_index_to_block_index(global_block_index);
 	ERR_FAIL_NULL_MSG(chunk, "Could not find chunk");
 	chunk->set_block_type(block_index, block_type);
+
+	if (block_on_border(block_index)) {
+		for (int32_t d = 0; d < BlockDirection::COUNT; ++d) {
+			const GlobalBlockIndex neighbor_index = global_block_index + face_dirs[d];
+			Ref<ChunkInfo> possible_neighbor_chunk = get_chunk(neighbor_index);
+			if (possible_neighbor_chunk.is_valid() && possible_neighbor_chunk != chunk) {
+				possible_neighbor_chunk->mark_chunk_dirty();
+			}
+		}
+	}
+
 	m_chunks_dirty = true;
 }
 
@@ -252,6 +281,11 @@ void CubeBuilder::rebuild_chunk_geometry() {
 		Ref<ArrayMesh> new_mesh = chunk->rebuild_chunk_geometry(self);
 		emit_signal("on_chunk_mesh_ready", chunk->get_chunk_index(), new_mesh);
 	}
+}
+
+Ref<ChunkInfo> CubeBuilder::get_chunk(const GlobalBlockIndex& index) const{
+	ChunkIndex chunk_index = get_chunk_from_global(index);
+	return m_chunks.get(chunk_index, nullptr);
 }
 
 Ref<ChunkInfo> CubeBuilder::get_or_create_chunk(const GlobalBlockIndex& index) {

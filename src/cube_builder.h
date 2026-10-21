@@ -44,6 +44,7 @@ public:
 	Ref<ArrayMesh> rebuild_chunk_geometry(const Ref<CubeBuilder>& builder);
 
 	ChunkIndex get_chunk_index() const { return m_chunk_index; }
+	void mark_chunk_dirty() { m_chunk_dirty = true; }
 protected:
 	static void _bind_methods();
 	static int32_t convert_index_to_address(const BlockIndex& index);
@@ -65,6 +66,7 @@ protected:
 	TypedDictionary<ChunkIndex, Ref<ChunkInfo>> m_chunks; //index to ChunkInfo
 
 	Ref<ChunkInfo> get_or_create_chunk(const GlobalBlockIndex& index);
+	Ref<ChunkInfo> get_chunk(const GlobalBlockIndex& index) const;
 	static ChunkIndex get_chunk_from_global(const GlobalBlockIndex& index);
 
 	bool m_chunks_dirty;
@@ -72,6 +74,7 @@ protected:
 
 public:
 	void set_block(const GlobalBlockIndex& global_block_index, const BlockType& blockType);
+	int get_block(const GlobalBlockIndex& global_block_index) const;
 	void clear_all_blocks();
 
 	bool is_block_air(const GlobalBlockIndex& global_block_index) const;
