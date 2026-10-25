@@ -2,6 +2,7 @@
 #include <godot_cpp/core/error_macros.hpp>
 #include <godot_cpp/classes/array_mesh.hpp>
 #include <godot_cpp/classes/mesh.hpp>
+#include <godot_cpp/templates/local_vector.hpp>
 
 using namespace godot;
 
@@ -49,6 +50,19 @@ static bool is_block_air(const BlockType& type) {
 	return type == 0;
 }
 
+void ChunkInfo::copy_blocks_from(const PackedInt32Array& blocks) {
+	ERR_FAIL_NULL_MSG(m_block_types, "Block array was null in ChunkInfo");
+	const int32_t block_count = chunk_width * chunk_height * chunk_depth;
+	ERR_FAIL_COND_MSG(blocks.size() != block_count, vformat("Expected %d blocks for a chunk, got %d", block_count, blocks.size()));
+
+	const int32_t* source = blocks.ptr();
+	for (int32_t i = 0; i < block_count; ++i) {
+		const BlockIndex index(i % chunk_width, i / (chunk_width * chunk_depth), (i / chunk_width) % chunk_depth);
+		m_block_types[convert_index_to_address(index)] = source[i];
+	}
+	m_chunk_dirty = true;
+}
+
 static const Vector3 face_corners[24] = {
 	Vector3(0, 1, 1), Vector3(0, 1, 0), Vector3(1, 1, 0), Vector3(1, 1, 1),
 	Vector3(0, 0, 0), Vector3(0, 0, 1), Vector3(1, 0, 1), Vector3(1, 0, 0),
@@ -88,6 +102,14 @@ bool CubeBuilder::is_block_air(const GlobalBlockIndex& global_block_index) const
 	return chunk_info->get_block_at(block_index) == 0;
 }
 
+template <typename TPacked, typename T>
+static TPacked to_packed(const LocalVector<T>& values) {
+	TPacked packed;
+	packed.resize(values.size());
+	memcpy(packed.ptrw(), values.ptr(), values.size() * sizeof(T));
+	return packed;
+}
+
 Ref<ArrayMesh> ChunkInfo::rebuild_chunk_geometry(const Ref<CubeBuilder>& builder) {
 	if (!m_chunk_dirty)
 		return nullptr;
@@ -96,44 +118,70 @@ Ref<ArrayMesh> ChunkInfo::rebuild_chunk_geometry(const Ref<CubeBuilder>& builder
 
 	m_chunk_dirty = false;
 
-	PackedVector3Array verts;
-	PackedVector3Array normals;
-	PackedVector2Array uvs;
-	PackedInt32Array indices;
+	// gathered here and copied into packed arrays once at the end, because every append to a
+	// packed array is a call into the engine
+	LocalVector<Vector3> verts;
+	LocalVector<Vector3> normals;
+	LocalVector<Vector2> uvs;
+	LocalVector<Color> colors;
+	LocalVector<int32_t> indices;
 
-	const GlobalBlockIndex chunk_first_block = Vector3i(m_chunk_index.x * chunk_width, m_chunk_index.y * chunk_height, m_chunk_index.z * chunk_depth);
+	// looked up once here, since finding a chunk goes through a Variant dictionary
+	Ref<ChunkInfo> neighbors[BlockDirection::COUNT];
+	for (int32_t d = 0; d < BlockDirection::COUNT; ++d) {
+		neighbors[d] = builder->find_chunk(m_chunk_index + face_dirs[d]);
+	}
 
 	const int32_t block_count = chunk_width * chunk_height * chunk_depth;
+	// faces are drawn against air and against hidden blocks, which draw themselves
+	auto is_open = [&builder](const BlockType& type) {
+		return is_block_air(type) || builder->is_block_type_hidden(type);
+	};
+
 	for (int32_t i = 0; i < block_count; ++i) {
 		const BlockType& block_type = m_block_types[i];
-		if (is_block_air(block_type)) {
+		if (is_open(block_type)) {
 			continue;
 		}
 
 		const BlockIndex block_index = convert_address_to_index(i);
 		const Vector3 block_center = Vector3(block_index);
+		const Color block_color = builder->get_block_color(block_type);
 		for (int32_t d = 0; d < BlockDirection::COUNT; ++d) {
 			const BlockIndex neighbor_index = block_index + face_dirs[d];
-			
-			const GlobalBlockIndex global_index = chunk_first_block + neighbor_index;
-			if (!builder->is_block_air(global_index)) {
+
+			bool neighbor_is_air;
+			if (out_of_bounds(neighbor_index)) {
+				// one step out of this chunk always lands in the neighbor on that side
+				const Ref<ChunkInfo>& neighbor = neighbors[d];
+				if (!neighbor.is_valid() || neighbor->m_block_types == nullptr) {
+					neighbor_is_air = true;
+				} else {
+					const BlockIndex wrapped((neighbor_index.x + chunk_width) % chunk_width, (neighbor_index.y + chunk_height) % chunk_height, (neighbor_index.z + chunk_depth) % chunk_depth);
+					neighbor_is_air = is_open(neighbor->m_block_types[convert_index_to_address(wrapped)]);
+				}
+			} else {
+				neighbor_is_air = is_open(m_block_types[convert_index_to_address(neighbor_index)]);
+			}
+			if (!neighbor_is_air) {
 				continue;
 			}
 
 			const int32_t base = verts.size();
 			Vector3 normal = Vector3(face_dirs[d]);
 			for (int32_t c = 0; c < 4; ++c) {
-				verts.append(block_center + face_corners[d * 4 + c]);
-				normals.append(normal);
-				uvs.append(face_uvs[c]);
+				verts.push_back(block_center + face_corners[d * 4 + c]);
+				normals.push_back(normal);
+				uvs.push_back(face_uvs[c]);
+				colors.push_back(block_color);
 			}
 
-			indices.append(base);
-			indices.append(base + 1);
-			indices.append(base + 2);
-			indices.append(base);
-			indices.append(base + 2);
-			indices.append(base + 3);
+			indices.push_back(base);
+			indices.push_back(base + 1);
+			indices.push_back(base + 2);
+			indices.push_back(base);
+			indices.push_back(base + 2);
+			indices.push_back(base + 3);
 		}
 	}
 
@@ -146,10 +194,11 @@ Ref<ArrayMesh> ChunkInfo::rebuild_chunk_geometry(const Ref<CubeBuilder>& builder
 
 	Array mesh_attributes;
 	mesh_attributes.resize(Mesh::ARRAY_MAX);
-	mesh_attributes[Mesh::ARRAY_VERTEX] = verts;
-	mesh_attributes[Mesh::ARRAY_NORMAL] = normals;
-	mesh_attributes[Mesh::ARRAY_TEX_UV] = uvs;
-	mesh_attributes[Mesh::ARRAY_INDEX] = indices;
+	mesh_attributes[Mesh::ARRAY_VERTEX] = to_packed<PackedVector3Array>(verts);
+	mesh_attributes[Mesh::ARRAY_NORMAL] = to_packed<PackedVector3Array>(normals);
+	mesh_attributes[Mesh::ARRAY_TEX_UV] = to_packed<PackedVector2Array>(uvs);
+	mesh_attributes[Mesh::ARRAY_COLOR] = to_packed<PackedColorArray>(colors);
+	mesh_attributes[Mesh::ARRAY_INDEX] = to_packed<PackedInt32Array>(indices);
 
 	new_mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, mesh_attributes);
 	return new_mesh;
@@ -192,10 +241,13 @@ BlockIndex ChunkInfo::convert_address_to_index(const int32_t& address) {
 }
 
 CubeBuilder::CubeBuilder() {
-	m_chunks_dirty = false;
 }
 
 CubeBuilder::~CubeBuilder() {
+}
+
+Ref<ChunkInfo> CubeBuilder::find_chunk(const ChunkIndex& chunk_index) const {
+	return m_chunks.get(chunk_index, nullptr);
 }
 
 int CubeBuilder::get_block(const GlobalBlockIndex& global_block_index) const {
@@ -210,10 +262,15 @@ int CubeBuilder::get_block(const GlobalBlockIndex& global_block_index) const {
 
 void CubeBuilder::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_block", "global_block_index", "block_type"), &CubeBuilder::set_block);
-	ClassDB::bind_method(D_METHOD("rebuild_chunk_geometry"), &CubeBuilder::rebuild_chunk_geometry);
+	ClassDB::bind_method(D_METHOD("set_chunk_blocks", "chunk_index", "blocks"), &CubeBuilder::set_chunk_blocks);
+	ClassDB::bind_method(D_METHOD("rebuild_chunk_geometry", "max_chunks"), &CubeBuilder::rebuild_chunk_geometry, DEFVAL(-1));
 	ClassDB::bind_method(D_METHOD("clear_all_blocks"), &CubeBuilder::clear_all_blocks);
 	ClassDB::bind_static_method("CubeBuilder", D_METHOD("get_chunk_dimensions"), &CubeBuilder::get_chunk_dimensions);
 	ClassDB::bind_method(D_METHOD("get_block"), &CubeBuilder::get_block);
+	ClassDB::bind_method(D_METHOD("set_block_colors", "block_colors"), &CubeBuilder::set_block_colors);
+	ClassDB::bind_method(D_METHOD("get_block_colors"), &CubeBuilder::get_block_colors);
+	ClassDB::bind_method(D_METHOD("set_hidden_block_types", "block_types"), &CubeBuilder::set_hidden_block_types);
+	ClassDB::bind_method(D_METHOD("get_hidden_block_types"), &CubeBuilder::get_hidden_block_types);
 
 	ADD_SIGNAL(MethodInfo("on_chunk_mesh_ready", 
 		PropertyInfo(Variant::VECTOR3I, "chunk_index"),
@@ -226,7 +283,80 @@ Vector3i CubeBuilder::get_chunk_dimensions() {
 
 void CubeBuilder::clear_all_blocks() {
 	m_chunks.clear();
-	m_chunks_dirty = true;
+	m_dirty_chunks.clear();
+	m_urgent_chunks.clear();
+}
+
+void CubeBuilder::mark_chunk_for_rebuild(const Ref<ChunkInfo>& chunk, bool urgent) {
+	// a chunk can end up in both queues; whichever reaches it second finds it clean and skips it
+	if (urgent) {
+		m_urgent_chunks.push_back(chunk);
+	} else if (!chunk->is_chunk_dirty()) {
+		m_dirty_chunks.push_back(chunk);
+	}
+	chunk->mark_chunk_dirty();
+}
+
+void CubeBuilder::set_block_colors(const PackedColorArray& block_colors) {
+	CONCURRENCY_CHECK(m_grid_info_guard);
+	m_block_colors = block_colors;
+
+	// every existing chunk was meshed with the old colors
+	Array values = m_chunks.values();
+	for (int32_t i = 0; i < values.size(); i++) {
+		const Ref<ChunkInfo>& chunk = values[i];
+		if (chunk.is_valid()) {
+			mark_chunk_for_rebuild(chunk);
+		}
+	}
+}
+
+void CubeBuilder::set_hidden_block_types(const PackedInt32Array& block_types) {
+	CONCURRENCY_CHECK(m_grid_info_guard);
+	m_hidden_block_types.clear();
+	for (int32_t i = 0; i < block_types.size(); ++i) {
+		const BlockType block_type = block_types[i];
+		ERR_CONTINUE_MSG(block_type < 0, vformat("Block type %d can't be hidden", block_type));
+		if (block_type >= (BlockType)m_hidden_block_types.size()) {
+			const uint32_t old_size = m_hidden_block_types.size();
+			m_hidden_block_types.resize(block_type + 1);
+			for (uint32_t j = old_size; j < m_hidden_block_types.size(); ++j) {
+				m_hidden_block_types[j] = 0;
+			}
+		}
+		m_hidden_block_types[block_type] = 1;
+	}
+
+	// every existing chunk was meshed with the old set
+	Array values = m_chunks.values();
+	for (int32_t i = 0; i < values.size(); i++) {
+		const Ref<ChunkInfo>& chunk = values[i];
+		if (chunk.is_valid()) {
+			mark_chunk_for_rebuild(chunk);
+		}
+	}
+}
+
+PackedInt32Array CubeBuilder::get_hidden_block_types() const {
+	PackedInt32Array block_types;
+	for (uint32_t i = 0; i < m_hidden_block_types.size(); ++i) {
+		if (m_hidden_block_types[i] != 0) {
+			block_types.push_back((int32_t)i);
+		}
+	}
+	return block_types;
+}
+
+PackedColorArray CubeBuilder::get_block_colors() const {
+	return m_block_colors;
+}
+
+Color CubeBuilder::get_block_color(const BlockType& block_type) const {
+	if (block_type < 0 || block_type >= m_block_colors.size()) {
+		// make blocks without a color stand out
+		return Color(1, 0, 1);
+	}
+	return m_block_colors[block_type];
 }
 
 BlockIndex CubeBuilder::convert_global_index_to_block_index(const GlobalBlockIndex& global_block_index) {
@@ -247,6 +377,7 @@ void CubeBuilder::set_block(const GlobalBlockIndex& global_block_index, const Bl
 	Ref<ChunkInfo> chunk = get_or_create_chunk(global_block_index);
 	const BlockIndex block_index = convert_global_index_to_block_index(global_block_index);
 	ERR_FAIL_NULL_MSG(chunk, "Could not find chunk");
+	mark_chunk_for_rebuild(chunk, true);
 	chunk->set_block_type(block_index, block_type);
 
 	if (block_on_border(block_index)) {
@@ -254,30 +385,71 @@ void CubeBuilder::set_block(const GlobalBlockIndex& global_block_index, const Bl
 			const GlobalBlockIndex neighbor_index = global_block_index + face_dirs[d];
 			Ref<ChunkInfo> possible_neighbor_chunk = get_chunk(neighbor_index);
 			if (possible_neighbor_chunk.is_valid() && possible_neighbor_chunk != chunk) {
-				possible_neighbor_chunk->mark_chunk_dirty();
+				mark_chunk_for_rebuild(possible_neighbor_chunk, true);
 			}
 		}
 	}
-
-	m_chunks_dirty = true;
 }
 
-void CubeBuilder::rebuild_chunk_geometry() {
-	if (!m_chunks_dirty)
+void CubeBuilder::set_chunk_blocks(const ChunkIndex& chunk_index, const PackedInt32Array& blocks) {
+	CONCURRENCY_CHECK(m_grid_info_guard);
+
+	Ref<ChunkInfo> chunk = m_chunks.get(chunk_index, nullptr);
+	if (!chunk.is_valid()) {
+		// a missing chunk already reads as air, so an all air one doesn't need creating
+		const int32_t* source = blocks.ptr();
+		bool has_blocks = false;
+		for (int32_t i = 0; i < blocks.size() && !has_blocks; ++i) {
+			has_blocks = source[i] != 0;
+		}
+		if (!has_blocks) {
+			return;
+		}
+
+		chunk.instantiate();
+		chunk->initialize(chunk_index);
+		m_chunks.set(chunk_index, chunk);
+	}
+	mark_chunk_for_rebuild(chunk);
+	chunk->copy_blocks_from(blocks);
+
+	// neighbors may have faces against this chunk that are now hidden, or newly exposed
+	for (int32_t d = 0; d < BlockDirection::COUNT; ++d) {
+		Ref<ChunkInfo> neighbor = m_chunks.get(chunk_index + face_dirs[d], nullptr);
+		if (neighbor.is_valid()) {
+			mark_chunk_for_rebuild(neighbor);
+		}
+	}
+}
+
+void CubeBuilder::rebuild_chunk_geometry(int32_t max_chunks) {
+	if (m_dirty_chunks.is_empty() && m_urgent_chunks.is_empty()) {
 		return;
+	}
 
 	CONCURRENCY_CHECK(m_grid_info_guard);
-	m_chunks_dirty = false;
 
 	Ref<CubeBuilder> self = Ref<CubeBuilder>(this);
 
-	Array values = m_chunks.values();
-	const int32_t value_count = values.size();
-	for (int32_t i = 0; i < value_count; i++) {
-		const Ref<ChunkInfo>& chunk = values[i];
-		if (!chunk.is_valid())
+	// every urgent chunk, then this call's share of the rest off the front; the others wait for the next call
+	LocalVector<Ref<ChunkInfo>> batch = std::move(m_urgent_chunks);
+	m_urgent_chunks = LocalVector<Ref<ChunkInfo>>();
+	uint32_t batch_size = m_dirty_chunks.size();
+	if (max_chunks >= 0 && uint32_t(max_chunks) < batch_size) {
+		batch_size = max_chunks;
+	}
+	LocalVector<Ref<ChunkInfo>> rest;
+	for (uint32_t i = 0; i < m_dirty_chunks.size(); i++) {
+		(i < batch_size ? batch : rest).push_back(m_dirty_chunks[i]);
+	}
+	m_dirty_chunks = std::move(rest);
+
+	for (uint32_t i = 0; i < batch.size(); i++) {
+		const Ref<ChunkInfo>& chunk = batch[i];
+		if (!chunk->is_chunk_dirty()) {
 			continue;
-		
+		}
+		// only rebuilt chunks are reported; a null mesh means the chunk has no faces left
 		Ref<ArrayMesh> new_mesh = chunk->rebuild_chunk_geometry(self);
 		emit_signal("on_chunk_mesh_ready", chunk->get_chunk_index(), new_mesh);
 	}
@@ -302,9 +474,12 @@ Ref<ChunkInfo> CubeBuilder::get_or_create_chunk(const GlobalBlockIndex& index) {
 	return chunk;
 }
 
+// rounds toward negative infinity, so block -1 lands in chunk -1 rather than chunk 0
+static int32_t floor_div(int32_t value, int32_t divisor) {
+	const int32_t quotient = value / divisor;
+	return (value % divisor != 0 && value < 0) ? quotient - 1 : quotient;
+}
+
 ChunkIndex CubeBuilder::get_chunk_from_global(const GlobalBlockIndex& index) {
-	int32_t x = UtilityFunctions::floor(float(index.x) / float(chunk_width));
-	int32_t y = UtilityFunctions::floor(float(index.y) / float(chunk_height));
-	int32_t z = UtilityFunctions::floor(float(index.z) / float(chunk_depth));
-	return ChunkIndex(x, y, z);
+	return ChunkIndex(floor_div(index.x, chunk_width), floor_div(index.y, chunk_height), floor_div(index.z, chunk_depth));
 }
