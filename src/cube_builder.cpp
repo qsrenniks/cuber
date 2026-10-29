@@ -85,6 +85,22 @@ static const Vector3i face_dirs[6] = {
 	Vector3i(0, 0, -1), 
 };
 
+Vector2i ChunkInfo::get_light_at(const BlockIndex& index) const {
+	if (m_light.is_empty() || out_of_bounds(index)) {
+		return Vector2i(max_light, 0);
+	}
+	const uint8_t packed = m_light[convert_index_to_address(index)];
+	return Vector2i(packed >> 4, packed & 0x0F);
+}
+
+Vector2i CubeBuilder::get_light_at(const GlobalBlockIndex& global_block_index) const {
+	Ref<ChunkInfo> chunk = get_chunk(global_block_index);
+	if (!chunk.is_valid()) {
+		return Vector2i(max_light, 0);
+	}
+	return chunk->get_light_at(convert_global_index_to_block_index(global_block_index));
+}
+
 BlockType ChunkInfo::get_block_at(const BlockIndex& index) {
 	const int32_t address = convert_index_to_address(index);
 	ERR_FAIL_COND_V_MSG(address < 0 || address >= (chunk_width * chunk_height * chunk_depth), 0, "Tried indexing outside of bounds");
@@ -110,6 +126,56 @@ static TPacked to_packed(const LocalVector<T>& values) {
 	return packed;
 }
 
+// the region a chunk's light is worked out over: the chunk and max_light blocks all round it, so anything that could
+// shine on it is included
+static const int32_t light_pad = max_light;
+static const int32_t light_dim = chunk_width + 2 * light_pad;
+static const int32_t light_cells = light_dim * light_dim * light_dim;
+static_assert(chunk_width == chunk_height && chunk_height == chunk_depth, "the light region assumes cubic chunks");
+static_assert(light_pad < chunk_width, "the light region reaches only into the chunks next to this one");
+
+// how many layers of chunks a column has at most, from y = 0 up; the sky is looked for this far up too
+static const int32_t max_chunk_layers = 16;
+
+// what the light region holds where a neighbouring column isn't loaded yet: not a real block, and solid, so light
+// stops at it and faces against it aren't drawn
+static const BlockType unloaded_block = -1;
+
+// x, y and z run from 0 to light_dim; the chunk itself starts at light_pad
+static inline int32_t region_index(int32_t x, int32_t y, int32_t z) {
+	return (y * light_dim + z) * light_dim + x;
+}
+
+// the corner shading for how many of a corner's three neighbours block it: none, one, two, or both sides
+static const float corner_shading[4] = { 1.0f, 0.8f, 0.62f, 0.45f };
+
+// spreads every level in queue out through the blocks that let light through, a level less per block
+static void spread_light(uint8_t* light, const BlockType* types, const Ref<CubeBuilder>& builder, LocalVector<int32_t>& queue) {
+	static const int32_t steps[6] = { 1, -1, light_dim, -light_dim, light_dim * light_dim, -light_dim * light_dim };
+	for (uint32_t head = 0; head < queue.size(); ++head) {
+		const int32_t i = queue[head];
+		const uint8_t level = light[i];
+		if (level <= 1) {
+			continue;
+		}
+		const int32_t x = i % light_dim;
+		const int32_t z = (i / light_dim) % light_dim;
+		const int32_t y = i / (light_dim * light_dim);
+		const bool inside[6] = { x + 1 < light_dim, x > 0, z + 1 < light_dim, z > 0, y + 1 < light_dim, y > 0 };
+		for (int32_t s = 0; s < 6; ++s) {
+			if (!inside[s]) {
+				continue;
+			}
+			const int32_t n = i + steps[s];
+			if (light[n] >= level - 1 || !builder->lets_light_through(types[n])) {
+				continue;
+			}
+			light[n] = level - 1;
+			queue.push_back(n);
+		}
+	}
+}
+
 Ref<ArrayMesh> ChunkInfo::rebuild_chunk_geometry(const Ref<CubeBuilder>& builder) {
 	if (!m_chunk_dirty)
 		return nullptr;
@@ -118,70 +184,224 @@ Ref<ArrayMesh> ChunkInfo::rebuild_chunk_geometry(const Ref<CubeBuilder>& builder
 
 	m_chunk_dirty = false;
 
+	// the chunks within light's reach, looked up once, since finding a chunk goes through a Variant dictionary
+	Ref<ChunkInfo> nearby_refs[27];
+	ChunkInfo* nearby[27];
+	// what a missing chunk reads as: air, or solid where its column isn't loaded yet
+	BlockType missing[27];
+	for (int32_t i = 0; i < 27; ++i) {
+		const Vector3i offset(i % 3 - 1, (i / 3) % 3 - 1, i / 9 - 1);
+		nearby_refs[i] = offset == Vector3i() ? Ref<ChunkInfo>(this) : builder->find_chunk(m_chunk_index + offset);
+		nearby[i] = nearby_refs[i].is_valid() && nearby_refs[i]->m_block_types ? nearby_refs[i].ptr() : nullptr;
+		missing[i] = builder->is_column_unloaded(Vector2i(m_chunk_index.x + offset.x, m_chunk_index.z + offset.z)) ? unloaded_block : 0;
+	}
+
+	// every block in the light region, read once
+	LocalVector<BlockType> types;
+	types.resize(light_cells);
+	for (int32_t y = 0; y < light_dim; ++y) {
+		const int32_t ly = y - light_pad;
+		const int32_t cy = ly < 0 ? -1 : (ly >= chunk_height ? 1 : 0);
+		for (int32_t z = 0; z < light_dim; ++z) {
+			const int32_t lz = z - light_pad;
+			const int32_t cz = lz < 0 ? -1 : (lz >= chunk_depth ? 1 : 0);
+			for (int32_t x = 0; x < light_dim; ++x) {
+				const int32_t lx = x - light_pad;
+				const int32_t cx = lx < 0 ? -1 : (lx >= chunk_width ? 1 : 0);
+				const int32_t n = (cx + 1) + (cy + 1) * 3 + (cz + 1) * 9;
+				const ChunkInfo* chunk = nearby[n];
+				types[region_index(x, y, z)] = chunk ? chunk->m_block_types[convert_index_to_address(BlockIndex(lx - cx * chunk_width, ly - cy * chunk_height, lz - cz * chunk_depth))] : missing[n];
+			}
+		}
+	}
+
+	auto is_open = [&builder](const BlockType& type) {
+		return builder->lets_light_through(type);
+	};
+
+	// whether anything above the region keeps the sky off each of its columns; chunks that don't exist are air
+	static const int32_t chunks_above = 16;
+	LocalVector<uint8_t> roofed;
+	roofed.resize(light_dim * light_dim);
+	for (int32_t dz = -1; dz <= 1; ++dz) {
+		for (int32_t dx = -1; dx <= 1; ++dx) {
+			// ground that isn't loaded yet keeps the sky off, until it arrives and this is rebuilt
+			const bool unloaded = builder->is_column_unloaded(Vector2i(m_chunk_index.x + dx, m_chunk_index.z + dz));
+			Ref<ChunkInfo> column[chunks_above];
+			for (int32_t dy = 1; dy < chunks_above; ++dy) {
+				column[dy] = builder->find_chunk(m_chunk_index + Vector3i(dx, dy, dz));
+			}
+			for (int32_t z = 0; z < light_dim; ++z) {
+				const int32_t lz = z - light_pad;
+				if ((lz < 0 ? -1 : (lz >= chunk_depth ? 1 : 0)) != dz) {
+					continue;
+				}
+				for (int32_t x = 0; x < light_dim; ++x) {
+					const int32_t lx = x - light_pad;
+					if ((lx < 0 ? -1 : (lx >= chunk_width ? 1 : 0)) != dx) {
+						continue;
+					}
+					bool covered = unloaded;
+					// from just above the region's top, up through every chunk above
+					for (int32_t ly = light_dim - light_pad; ly < chunks_above * chunk_height && !covered; ++ly) {
+						const Ref<ChunkInfo>& chunk = column[ly / chunk_height];
+						if (!chunk.is_valid() || chunk->m_block_types == nullptr) {
+							ly += chunk_height - 1 - ly % chunk_height;
+							continue;
+						}
+						const BlockIndex inner(lx - dx * chunk_width, ly % chunk_height, lz - dz * chunk_depth);
+						covered = !is_open(chunk->m_block_types[convert_index_to_address(inner)]);
+					}
+					roofed[z * light_dim + x] = covered;
+				}
+			}
+		}
+	}
+
+	// sky light: full straight down every open column until something stops it, then spreading sideways
+	LocalVector<uint8_t> sky;
+	sky.resize(light_cells);
+	memset(sky.ptr(), 0, light_cells);
+	LocalVector<int32_t> queue;
+	for (int32_t z = 0; z < light_dim; ++z) {
+		for (int32_t x = 0; x < light_dim; ++x) {
+			if (roofed[z * light_dim + x]) {
+				continue;
+			}
+			for (int32_t y = light_dim - 1; y >= 0; --y) {
+				const int32_t i = region_index(x, y, z);
+				if (!is_open(types[i])) {
+					break;
+				}
+				sky[i] = max_light;
+				queue.push_back(i);
+			}
+		}
+	}
+	spread_light(sky.ptr(), types.ptr(), builder, queue);
+
+	// block light: from everything that gives it off
+	LocalVector<uint8_t> glow;
+	glow.resize(light_cells);
+	memset(glow.ptr(), 0, light_cells);
+	queue.clear();
+	for (int32_t i = 0; i < light_cells; ++i) {
+		const int32_t emission = builder->get_block_emission(types[i]);
+		if (emission > 0) {
+			glow[i] = (uint8_t)MIN(emission, max_light);
+			queue.push_back(i);
+		}
+	}
+	spread_light(glow.ptr(), types.ptr(), builder, queue);
+
+	// kept for things that aren't blocks to be lit by, through CubeBuilder::get_light_at
+	m_light.resize(chunk_width * chunk_height * chunk_depth);
+	for (int32_t ly = 0; ly < chunk_height; ++ly) {
+		for (int32_t lz = 0; lz < chunk_depth; ++lz) {
+			for (int32_t lx = 0; lx < chunk_width; ++lx) {
+				const int32_t i = region_index(lx + light_pad, ly + light_pad, lz + light_pad);
+				m_light[convert_index_to_address(BlockIndex(lx, ly, lz))] = uint8_t((sky[i] << 4) | glow[i]);
+			}
+		}
+	}
+
 	// gathered here and copied into packed arrays once at the end, because every append to a
 	// packed array is a call into the engine
 	LocalVector<Vector3> verts;
 	LocalVector<Vector3> normals;
 	LocalVector<Vector2> uvs;
+	LocalVector<Vector2> layers;
 	LocalVector<Color> colors;
+	LocalVector<float> lights;
 	LocalVector<int32_t> indices;
 
-	// looked up once here, since finding a chunk goes through a Variant dictionary
-	Ref<ChunkInfo> neighbors[BlockDirection::COUNT];
-	for (int32_t d = 0; d < BlockDirection::COUNT; ++d) {
-		neighbors[d] = builder->find_chunk(m_chunk_index + face_dirs[d]);
-	}
-
-	const int32_t block_count = chunk_width * chunk_height * chunk_depth;
-	// faces are drawn against air and against hidden blocks, which draw themselves
-	auto is_open = [&builder](const BlockType& type) {
-		return is_block_air(type) || builder->is_block_type_hidden(type);
-	};
-
-	for (int32_t i = 0; i < block_count; ++i) {
-		const BlockType& block_type = m_block_types[i];
-		if (is_open(block_type)) {
-			continue;
-		}
-
-		const BlockIndex block_index = convert_address_to_index(i);
-		const Vector3 block_center = Vector3(block_index);
-		const Color block_color = builder->get_block_color(block_type);
-		for (int32_t d = 0; d < BlockDirection::COUNT; ++d) {
-			const BlockIndex neighbor_index = block_index + face_dirs[d];
-
-			bool neighbor_is_air;
-			if (out_of_bounds(neighbor_index)) {
-				// one step out of this chunk always lands in the neighbor on that side
-				const Ref<ChunkInfo>& neighbor = neighbors[d];
-				if (!neighbor.is_valid() || neighbor->m_block_types == nullptr) {
-					neighbor_is_air = true;
-				} else {
-					const BlockIndex wrapped((neighbor_index.x + chunk_width) % chunk_width, (neighbor_index.y + chunk_height) % chunk_height, (neighbor_index.z + chunk_depth) % chunk_depth);
-					neighbor_is_air = is_open(neighbor->m_block_types[convert_index_to_address(wrapped)]);
+	for (int32_t ly = 0; ly < chunk_height; ++ly) {
+		for (int32_t lz = 0; lz < chunk_depth; ++lz) {
+			for (int32_t lx = 0; lx < chunk_width; ++lx) {
+				const Vector3i block(lx + light_pad, ly + light_pad, lz + light_pad);
+				const BlockType& block_type = types[region_index(block.x, block.y, block.z)];
+				// faces are drawn against air and against hidden blocks, which draw themselves
+				if (is_open(block_type)) {
+					continue;
 				}
-			} else {
-				neighbor_is_air = is_open(m_block_types[convert_index_to_address(neighbor_index)]);
-			}
-			if (!neighbor_is_air) {
-				continue;
-			}
 
-			const int32_t base = verts.size();
-			Vector3 normal = Vector3(face_dirs[d]);
-			for (int32_t c = 0; c < 4; ++c) {
-				verts.push_back(block_center + face_corners[d * 4 + c]);
-				normals.push_back(normal);
-				uvs.push_back(face_uvs[c]);
-				colors.push_back(block_color);
-			}
+				const Vector3 block_center = Vector3(lx, ly, lz);
+				const Color block_color = builder->get_block_color(block_type);
+				for (int32_t d = 0; d < BlockDirection::COUNT; ++d) {
+					const Vector3i front = block + face_dirs[d];
+					const int32_t front_index = region_index(front.x, front.y, front.z);
+					if (!is_open(types[front_index])) {
+						continue;
+					}
 
-			indices.push_back(base);
-			indices.push_back(base + 1);
-			indices.push_back(base + 2);
-			indices.push_back(base);
-			indices.push_back(base + 2);
-			indices.push_back(base + 3);
+					// the two directions across the face
+					int32_t across[2];
+					int32_t found = 0;
+					for (int32_t axis = 0; axis < 3; ++axis) {
+						if (face_dirs[d][axis] == 0) {
+							across[found++] = axis;
+						}
+					}
+
+					const int32_t base = verts.size();
+					const Vector3 normal = Vector3(face_dirs[d]);
+					const Vector2 layer(builder->get_block_face_layer(block_type, d), 0);
+					float shading[4];
+					for (int32_t c = 0; c < 4; ++c) {
+						const Vector3 corner = face_corners[d * 4 + c];
+						verts.push_back(block_center + corner);
+						normals.push_back(normal);
+						uvs.push_back(face_uvs[c]);
+						layers.push_back(layer);
+						colors.push_back(block_color);
+
+						// smooth light: the corner averages the block in front of the face with the ones beside and
+						// diagonally beside it on that corner's side, and is shaded by however many of those are solid
+						Vector3i side1 = front;
+						Vector3i side2 = front;
+						side1[across[0]] += corner[across[0]] > 0.5f ? 1 : -1;
+						side2[across[1]] += corner[across[1]] > 0.5f ? 1 : -1;
+						Vector3i diagonal = side1;
+						diagonal[across[1]] = side2[across[1]];
+						const int32_t i1 = region_index(side1.x, side1.y, side1.z);
+						const int32_t i2 = region_index(side2.x, side2.y, side2.z);
+						const int32_t i3 = region_index(diagonal.x, diagonal.y, diagonal.z);
+						const bool open1 = is_open(types[i1]);
+						const bool open2 = is_open(types[i2]);
+						// the diagonal is hidden when both sides are solid
+						const bool open3 = (open1 || open2) && is_open(types[i3]);
+						float sky_sum = sky[front_index];
+						float glow_sum = glow[front_index];
+						int32_t count = 1;
+						if (open1) { sky_sum += sky[i1]; glow_sum += glow[i1]; count++; }
+						if (open2) { sky_sum += sky[i2]; glow_sum += glow[i2]; count++; }
+						if (open3) { sky_sum += sky[i3]; glow_sum += glow[i3]; count++; }
+						const int32_t blocking = (!open1 && !open2) ? 3 : int32_t(!open1) + int32_t(!open2) + int32_t(!is_open(types[i3]));
+						shading[c] = corner_shading[blocking];
+						lights.push_back(sky_sum / count);
+						lights.push_back(glow_sum / count);
+						lights.push_back(shading[c]);
+						lights.push_back(0.0f);
+					}
+
+					// split the quad along whichever diagonal keeps the corner shading from smearing across it
+					if (shading[0] + shading[2] >= shading[1] + shading[3]) {
+						indices.push_back(base);
+						indices.push_back(base + 1);
+						indices.push_back(base + 2);
+						indices.push_back(base);
+						indices.push_back(base + 2);
+						indices.push_back(base + 3);
+					} else {
+						indices.push_back(base + 1);
+						indices.push_back(base + 2);
+						indices.push_back(base + 3);
+						indices.push_back(base + 1);
+						indices.push_back(base + 3);
+						indices.push_back(base);
+					}
+				}
+			}
 		}
 	}
 
@@ -197,10 +417,13 @@ Ref<ArrayMesh> ChunkInfo::rebuild_chunk_geometry(const Ref<CubeBuilder>& builder
 	mesh_attributes[Mesh::ARRAY_VERTEX] = to_packed<PackedVector3Array>(verts);
 	mesh_attributes[Mesh::ARRAY_NORMAL] = to_packed<PackedVector3Array>(normals);
 	mesh_attributes[Mesh::ARRAY_TEX_UV] = to_packed<PackedVector2Array>(uvs);
+	mesh_attributes[Mesh::ARRAY_TEX_UV2] = to_packed<PackedVector2Array>(layers);
 	mesh_attributes[Mesh::ARRAY_COLOR] = to_packed<PackedColorArray>(colors);
+	mesh_attributes[Mesh::ARRAY_CUSTOM0] = to_packed<PackedFloat32Array>(lights);
 	mesh_attributes[Mesh::ARRAY_INDEX] = to_packed<PackedInt32Array>(indices);
 
-	new_mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, mesh_attributes);
+	const int64_t light_format = int64_t(Mesh::ARRAY_CUSTOM_RGBA_FLOAT) << Mesh::ARRAY_FORMAT_CUSTOM0_SHIFT;
+	new_mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, mesh_attributes, Array(), Dictionary(), BitField<Mesh::ArrayFormat>(light_format));
 	return new_mesh;
 }
 
@@ -265,10 +488,16 @@ void CubeBuilder::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_chunk_blocks", "chunk_index", "blocks"), &CubeBuilder::set_chunk_blocks);
 	ClassDB::bind_method(D_METHOD("rebuild_chunk_geometry", "max_chunks"), &CubeBuilder::rebuild_chunk_geometry, DEFVAL(-1));
 	ClassDB::bind_method(D_METHOD("clear_all_blocks"), &CubeBuilder::clear_all_blocks);
+	ClassDB::bind_method(D_METHOD("set_column_loaded", "column"), &CubeBuilder::set_column_loaded);
 	ClassDB::bind_static_method("CubeBuilder", D_METHOD("get_chunk_dimensions"), &CubeBuilder::get_chunk_dimensions);
 	ClassDB::bind_method(D_METHOD("get_block"), &CubeBuilder::get_block);
 	ClassDB::bind_method(D_METHOD("set_block_colors", "block_colors"), &CubeBuilder::set_block_colors);
 	ClassDB::bind_method(D_METHOD("get_block_colors"), &CubeBuilder::get_block_colors);
+	ClassDB::bind_method(D_METHOD("set_block_face_layers", "face_layers"), &CubeBuilder::set_block_face_layers);
+	ClassDB::bind_method(D_METHOD("get_block_face_layers"), &CubeBuilder::get_block_face_layers);
+	ClassDB::bind_method(D_METHOD("set_block_light_emission", "emission"), &CubeBuilder::set_block_light_emission);
+	ClassDB::bind_method(D_METHOD("get_block_light_emission"), &CubeBuilder::get_block_light_emission);
+	ClassDB::bind_method(D_METHOD("get_light_at", "global_block_index"), &CubeBuilder::get_light_at);
 	ClassDB::bind_method(D_METHOD("set_hidden_block_types", "block_types"), &CubeBuilder::set_hidden_block_types);
 	ClassDB::bind_method(D_METHOD("get_hidden_block_types"), &CubeBuilder::get_hidden_block_types);
 
@@ -285,6 +514,29 @@ void CubeBuilder::clear_all_blocks() {
 	m_chunks.clear();
 	m_dirty_chunks.clear();
 	m_urgent_chunks.clear();
+	m_loaded_columns.clear();
+}
+
+void CubeBuilder::set_column_loaded(const Vector2i& column) {
+	if (m_loaded_columns.has(column)) {
+		return;
+	}
+	m_loaded_columns.insert(column);
+	// chunks beside it lit and drawn as if it were solid ground; set_chunk_blocks already marks the ones next to its
+	// chunks with blocks, which leaves the ones beside its air, like a cliff face standing over it
+	for (int32_t dz = -1; dz <= 1; ++dz) {
+		for (int32_t dx = -1; dx <= 1; ++dx) {
+			if (dx == 0 && dz == 0) {
+				continue;
+			}
+			for (int32_t y = 0; y < max_chunk_layers; ++y) {
+				Ref<ChunkInfo> neighbor = m_chunks.get(ChunkIndex(column.x + dx, y, column.y + dz), nullptr);
+				if (neighbor.is_valid()) {
+					mark_chunk_for_rebuild(neighbor);
+				}
+			}
+		}
+	}
 }
 
 void CubeBuilder::mark_chunk_for_rebuild(const Ref<ChunkInfo>& chunk, bool urgent) {
@@ -351,6 +603,109 @@ PackedColorArray CubeBuilder::get_block_colors() const {
 	return m_block_colors;
 }
 
+void CubeBuilder::set_block_face_layers(const PackedInt32Array& face_layers) {
+	CONCURRENCY_CHECK(m_grid_info_guard);
+	m_block_face_layers = face_layers;
+
+	// every existing chunk was meshed with the old layers
+	Array values = m_chunks.values();
+	for (int32_t i = 0; i < values.size(); i++) {
+		const Ref<ChunkInfo>& chunk = values[i];
+		if (chunk.is_valid()) {
+			mark_chunk_for_rebuild(chunk);
+		}
+	}
+}
+
+void CubeBuilder::set_block_light_emission(const PackedInt32Array& emission) {
+	CONCURRENCY_CHECK(m_grid_info_guard);
+	m_block_light_emission = emission;
+
+	// every existing chunk was lit with the old emission
+	Array values = m_chunks.values();
+	for (int32_t i = 0; i < values.size(); i++) {
+		const Ref<ChunkInfo>& chunk = values[i];
+		if (chunk.is_valid()) {
+			mark_chunk_for_rebuild(chunk);
+		}
+	}
+}
+
+PackedInt32Array CubeBuilder::get_block_light_emission() const {
+	return m_block_light_emission;
+}
+
+void CubeBuilder::mark_light_around(const GlobalBlockIndex& global_block_index) {
+	const ChunkIndex center = get_chunk_from_global(global_block_index);
+	for (int32_t i = 0; i < 27; ++i) {
+		Ref<ChunkInfo> neighbor = m_chunks.get(center + Vector3i(i % 3 - 1, (i / 3) % 3 - 1, i / 9 - 1), nullptr);
+		if (neighbor.is_valid()) {
+			mark_chunk_for_rebuild(neighbor);
+		}
+	}
+
+	// whether the sky reaches the edit: nothing above it that light can't pass
+	static const int32_t chunks_above = 16;
+	for (int32_t y = global_block_index.y + 1; y < (center.y + chunks_above) * chunk_height; ++y) {
+		const GlobalBlockIndex above(global_block_index.x, y, global_block_index.z);
+		Ref<ChunkInfo> chunk = get_chunk(above);
+		if (!chunk.is_valid()) {
+			// a whole chunk of air
+			y += chunk_height - 1 - convert_global_index_to_block_index(above).y;
+			continue;
+		}
+		if (!lets_light_through(chunk->get_block_at(convert_global_index_to_block_index(above)))) {
+			return;
+		}
+	}
+	// it does, so the sky now reaches further down that column, or no longer does, as far as the first block below
+	// that stops light. Light spreads from there at most max_light blocks, and each chunk lights a region padded
+	// by max_light, so chunks below that reach are lit the same either way
+	int32_t stop = global_block_index.y - 1;
+	const int32_t lowest_chunk_y = center.y - chunks_above;
+	while (stop >= lowest_chunk_y * chunk_height) {
+		const GlobalBlockIndex below(global_block_index.x, stop, global_block_index.z);
+		Ref<ChunkInfo> chunk = get_chunk(below);
+		if (!chunk.is_valid()) {
+			// a whole chunk of air, or the bottom of the world
+			if (stop < 0) {
+				break;
+			}
+			stop -= convert_global_index_to_block_index(below).y + 1;
+			continue;
+		}
+		if (!lets_light_through(chunk->get_block_at(convert_global_index_to_block_index(below)))) {
+			break;
+		}
+		--stop;
+	}
+	const int32_t lowest_y = stop - light_pad;
+	// the chunks just below were marked above already
+	const int32_t lowest_dy = center.y - get_chunk_from_global(GlobalBlockIndex(global_block_index.x, lowest_y, global_block_index.z)).y;
+	for (int32_t dz = -1; dz <= 1; ++dz) {
+		for (int32_t dx = -1; dx <= 1; ++dx) {
+			for (int32_t dy = 2; dy <= MIN(lowest_dy, chunks_above); ++dy) {
+				Ref<ChunkInfo> below = m_chunks.get(center + Vector3i(dx, -dy, dz), nullptr);
+				if (below.is_valid()) {
+					mark_chunk_for_rebuild(below);
+				}
+			}
+		}
+	}
+}
+
+PackedInt32Array CubeBuilder::get_block_face_layers() const {
+	return m_block_face_layers;
+}
+
+int32_t CubeBuilder::get_block_face_layer(const BlockType& block_type, int32_t direction) const {
+	const int64_t address = (int64_t)block_type * BlockDirection::COUNT + direction;
+	if (block_type < 0 || address >= m_block_face_layers.size()) {
+		return -1;
+	}
+	return m_block_face_layers[address];
+}
+
 Color CubeBuilder::get_block_color(const BlockType& block_type) const {
 	if (block_type < 0 || block_type >= m_block_colors.size()) {
 		// make blocks without a color stand out
@@ -377,8 +732,14 @@ void CubeBuilder::set_block(const GlobalBlockIndex& global_block_index, const Bl
 	Ref<ChunkInfo> chunk = get_or_create_chunk(global_block_index);
 	const BlockIndex block_index = convert_global_index_to_block_index(global_block_index);
 	ERR_FAIL_NULL_MSG(chunk, "Could not find chunk");
+	const BlockType old_type = chunk->get_block_at(block_index);
 	mark_chunk_for_rebuild(chunk, true);
 	chunk->set_block_type(block_index, block_type);
+
+	// a block that lets light through differently, or gives off different light, relights what's around it
+	if (lets_light_through(old_type) != lets_light_through(block_type) || get_block_emission(old_type) != get_block_emission(block_type)) {
+		mark_light_around(global_block_index);
+	}
 
 	if (block_on_border(block_index)) {
 		for (int32_t d = 0; d < BlockDirection::COUNT; ++d) {
@@ -413,10 +774,11 @@ void CubeBuilder::set_chunk_blocks(const ChunkIndex& chunk_index, const PackedIn
 	mark_chunk_for_rebuild(chunk);
 	chunk->copy_blocks_from(blocks);
 
-	// neighbors may have faces against this chunk that are now hidden, or newly exposed
-	for (int32_t d = 0; d < BlockDirection::COUNT; ++d) {
-		Ref<ChunkInfo> neighbor = m_chunks.get(chunk_index + face_dirs[d], nullptr);
-		if (neighbor.is_valid()) {
+	// neighbors may have faces against this chunk that are now hidden, or newly exposed, and light from it, or
+	// shade, reaches every chunk all round
+	for (int32_t i = 0; i < 27; ++i) {
+		Ref<ChunkInfo> neighbor = m_chunks.get(chunk_index + Vector3i(i % 3 - 1, (i / 3) % 3 - 1, i / 9 - 1), nullptr);
+		if (neighbor.is_valid() && neighbor != chunk) {
 			mark_chunk_for_rebuild(neighbor);
 		}
 	}
