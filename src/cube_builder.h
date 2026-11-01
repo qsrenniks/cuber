@@ -57,8 +57,12 @@ public:
 	// the sky light and block light at a block in this chunk as of its last rebuild, as (sky, block); full sky and no
 	// block light before its first
 	Vector2i get_light_at(const BlockIndex& index) const;
-	void mark_chunk_dirty() { m_chunk_dirty = true; }
+	// [geometry] is false when only the chunk's light changed, like a block dug nearby, so its faces stay the same
+	void mark_chunk_dirty(bool geometry = true) { m_chunk_dirty = true; m_geometry_dirty = m_geometry_dirty || geometry; }
 	bool is_chunk_dirty() const { return m_chunk_dirty; }
+	// goes up every rebuild that changed the chunk's faces, not just its light, so whatever is built from them, like
+	// collision, can tell when it's out of date
+	int32_t get_geometry_version() const { return m_geometry_version; }
 protected:
 	static void _bind_methods();
 	static int32_t convert_index_to_address(const BlockIndex& index);
@@ -69,6 +73,9 @@ protected:
 	ChunkIndex m_chunk_index;
 	BlockType* m_block_types;
 	bool m_chunk_dirty;
+	// whether the faces may have changed since the last rebuild, as well as the light
+	bool m_geometry_dirty;
+	int32_t m_geometry_version;
 	// every block's light from the last rebuild, sky light in the high four bits and block light in the low four
 	LocalVector<uint8_t> m_light;
 };
@@ -86,8 +93,9 @@ protected:
 	static ChunkIndex get_chunk_from_global(const GlobalBlockIndex& index);
 
 	// call before changing a chunk's blocks; queues it for rebuild_chunk_geometry if it isn't already.
-	// urgent chunks are rebuilt on the next call ahead of everything else, whatever its max_chunks
-	void mark_chunk_for_rebuild(const Ref<ChunkInfo>& chunk, bool urgent = false);
+	// urgent chunks are rebuilt on the next call ahead of everything else, whatever its max_chunks. [geometry] is
+	// false when only its light can have changed, so its faces, and its geometry version, stay the same
+	void mark_chunk_for_rebuild(const Ref<ChunkInfo>& chunk, bool urgent = false, bool geometry = true);
 	// oldest first, so rebuild_chunk_geometry never has to walk every chunk looking for dirty ones
 	LocalVector<Ref<ChunkInfo>> m_dirty_chunks;
 	// single block edits, like the player mining, so they never wait behind a backlog of streamed chunks
@@ -99,9 +107,12 @@ protected:
 	PackedInt32Array m_block_face_layers;
 	// the light each block type gives off, 0 to max_light; indexed by BlockType
 	PackedInt32Array m_block_light_emission;
+	// the same, clamped to 0 to max_light, kept where reading it doesn't go through the engine: relighting a chunk
+	// reads it for every block in reach
+	LocalVector<uint8_t> m_emission_by_type;
 
-	// marks every chunk whose light an edit at global_block_index could change: the ones all round it, and, when
-	// the sky reaches the edit, every chunk below those too
+	// marks every chunk whose light an edit at global_block_index could change: the ones within light's reach of the
+	// edit and, when the sky reaches the edit, of the column below it that the sky now lights, or no longer does
 	void mark_light_around(const GlobalBlockIndex& global_block_index);
 	// block types left out of the chunk meshes, like ones drawn by their own nodes; indexed by BlockType
 	LocalVector<uint8_t> m_hidden_block_types;
@@ -145,7 +156,7 @@ public:
 	void set_block_light_emission(const PackedInt32Array& emission);
 	PackedInt32Array get_block_light_emission() const;
 	int32_t get_block_emission(const BlockType& block_type) const {
-		return block_type >= 0 && block_type < m_block_light_emission.size() ? m_block_light_emission[block_type] : 0;
+		return block_type >= 0 && block_type < (BlockType)m_emission_by_type.size() ? m_emission_by_type[block_type] : 0;
 	}
 	// light passes through air and through hidden blocks, which draw themselves thin
 	bool lets_light_through(const BlockType& block_type) const {
@@ -161,6 +172,10 @@ public:
 	}
 
 	bool is_block_air(const GlobalBlockIndex& global_block_index) const;
+
+	// goes up every time a rebuild of the chunk changes its faces rather than only its light, so collision built from
+	// its mesh only needs building again when this has moved. 0 for a chunk that doesn't exist
+	int32_t get_chunk_geometry_version(const ChunkIndex& chunk_index) const;
 
 	// the light at a block as the chunk meshes have it, as (sky light, block light), each 0 to 15, for lighting
 	// things that aren't blocks, like dropped items, to match. Where no chunk has been built it's open sky.
