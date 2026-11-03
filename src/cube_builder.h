@@ -45,7 +45,9 @@ public:
 	void initialize(const ChunkIndex& index);
 	void shutdown();
 
-	void set_block_type(const BlockIndex& index, const BlockType& block_type);
+	// [p_mark_dirty] is false for a change that leaves the chunk's faces and light as they were. Marking it dirty without
+	// queueing it, as CubeBuilder::mark_chunk_for_rebuild does, would keep it out of the queue for good
+	void set_block_type(const BlockIndex& index, const BlockType& block_type, bool p_mark_dirty = true);
 	BlockType get_block_at(const BlockIndex& index);
 
 	Ref<ArrayMesh> rebuild_chunk_geometry(const Ref<CubeBuilder>& builder);

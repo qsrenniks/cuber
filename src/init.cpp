@@ -1,6 +1,7 @@
 #include <godot_cpp/godot.hpp>
 
 #include "cube_builder.h"
+#include "water_simulation.h"
 
 using namespace godot;
 
@@ -9,6 +10,7 @@ void init_mod(ModuleInitializationLevel l) {
     {
         GDREGISTER_CLASS(CubeBuilder);
 		GDREGISTER_INTERNAL_CLASS(ChunkInfo);
+		GDREGISTER_CLASS(WaterSimulation);
     }
 }
 void uninit_mod(ModuleInitializationLevel) {}

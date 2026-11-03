@@ -38,14 +38,16 @@ static bool out_of_bounds(const BlockIndex& index) {
 		|| index.x >= chunk_width || index.y >= chunk_height || index.z >= chunk_depth;
 }
 
-void ChunkInfo::set_block_type(const BlockIndex& index, const BlockType& blockType) {
+void ChunkInfo::set_block_type(const BlockIndex& index, const BlockType& blockType, bool p_mark_dirty) {
 	ERR_FAIL_NULL_MSG(m_block_types, "Block array was null in ChunkInfo");
 	ERR_FAIL_COND_MSG(out_of_bounds(index), vformat("Block index [%d %d %d] is outside the chunk", index.x, index.y, index.z));
 	const int32_t block_address = convert_index_to_address(index);
 
 	//UtilityFunctions::print(vformat("Setting block %d to %d", block_address, blockType));
 	m_block_types[block_address] = blockType;
-	mark_chunk_dirty();
+	if (p_mark_dirty) {
+		mark_chunk_dirty();
+	}
 }
 
 static bool is_block_air(const BlockType& type) {
@@ -776,10 +778,24 @@ static bool block_on_border(const BlockIndex& index) {
 
 void CubeBuilder::set_block(const GlobalBlockIndex& global_block_index, const BlockType& block_type) {
 	CONCURRENCY_CHECK(m_grid_info_guard);
-	Ref<ChunkInfo> chunk = get_or_create_chunk(global_block_index);
-	const BlockIndex block_index = convert_global_index_to_block_index(global_block_index);
+	Ref<ChunkInfo> chunk = get_chunk(global_block_index);
+	const bool created = !chunk.is_valid();
+	if (created) {
+		chunk = get_or_create_chunk(global_block_index);
+	}
 	ERR_FAIL_NULL_MSG(chunk, "Could not find chunk");
+	const BlockIndex block_index = convert_global_index_to_block_index(global_block_index);
 	const BlockType old_type = chunk->get_block_at(block_index);
+
+	// Swapping one block that lets light through for another giving off the same light, like water flowing into air
+	// or changing level, changes no face and no light: neither is in the chunk mesh, and the blocks beside them are
+	// drawn and lit as if against air either way. So nothing is rebuilt, which spares flowing water a rebuild of two
+	// chunks and their collision for every level it changes. A chunk just created has never been built, so it is.
+	if (!created && lets_light_through(old_type) && lets_light_through(block_type) && get_block_emission(old_type) == get_block_emission(block_type)) {
+		chunk->set_block_type(block_index, block_type, false);
+		return;
+	}
+
 	mark_chunk_for_rebuild(chunk, true);
 	chunk->set_block_type(block_index, block_type);
 
